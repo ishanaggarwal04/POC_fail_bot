@@ -36,7 +36,7 @@ LOST_CATEGORY_FIELD_NAME = "Lost Category"
 # TEMPORARY TEST FILTER: when set, ONLY this issue key will actually be
 # updated (everyone else still gets evaluated/printed, just not sent to).
 # Set back to None once you're done testing and ready for a real full run.
-TEST_ISSUE_ONLY = "POC-5120"
+TEST_ISSUE_ONLY = None
 
 # TEMPORARY TEST LIMIT: when set, only the first N eligible tickets (after
 # TEST_ISSUE_ONLY filtering, if any) will actually be updated -- everything
