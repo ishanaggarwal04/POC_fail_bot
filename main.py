@@ -1,6 +1,8 @@
 import os
 import sys
 import requests
+from datetime import datetime, timezone
+from dateutil import parser as dateparser
 
 
 JIRA_BASE_URL = os.getenv(
@@ -28,10 +30,20 @@ LOST_REASON_TEXT = "This POC never reached In Trial status"
 LOST_CATEGORY_VALUE = "None"
 TARGET_STATUS_NAME = "POC fail"
 
+# Posted instead of the fields/transition when the ticket's most recent
+# comment was made in 2026 -- i.e. there's been recent human activity on it,
+# so we don't want to silently auto-close it. The Presales Owner is tagged
+# with a real @mention; the exact wording is built in
+# add_alert_comment() below.
+
+# The year threshold used to decide old vs. recent comments.
+CUTOFF_YEAR = 2026
+
 # Name of the fields as they appear in Jira -- resolved to customfield_XXXXX
 # ids automatically, no need to hardcode them.
 LOST_REASON_FIELD_NAME = "Lost Reason"
 LOST_CATEGORY_FIELD_NAME = "Lost Category"
+PRESALES_OWNER_FIELD_NAME = "Presales Owner"
 
 # TEMPORARY TEST FILTER: when set, ONLY this issue key will actually be
 # updated (everyone else still gets evaluated/printed, just not sent to).
@@ -53,6 +65,7 @@ session.headers.update({
 })
 
 _field_ids = {}
+_bot_account_id = None
 
 
 def jira_get(path, params=None):
@@ -107,12 +120,14 @@ def get_issues():
     issues = []
     next_page_token = None
 
+    presales_owner_field_id = get_field_id(PRESALES_OWNER_FIELD_NAME)
+
     while True:
 
         params = {
             "jql": JQL,
             "maxResults": 100,
-            "fields": "summary,status"
+            "fields": f"summary,status,created,{presales_owner_field_id}"
         }
 
         if next_page_token:
@@ -137,9 +152,85 @@ def get_issues():
     return issues
 
 
-def build_lost_reason_adf(text):
-    """Lost Reason is a rich-text field, so it needs an Atlassian Document
-    Format body rather than a plain string."""
+def get_bot_account_id():
+    """Returns (and caches) the accountId of the Jira user this script is
+    authenticating as -- i.e. whoever JIRA_EMAIL/JIRA_API_TOKEN belongs to.
+    Used to recognize the bot's own alert comments so it doesn't re-alert
+    on top of itself every batch."""
+
+    global _bot_account_id
+
+    if _bot_account_id is not None:
+        return _bot_account_id
+
+    data = jira_get("/rest/api/3/myself")
+    _bot_account_id = data["accountId"]
+
+    return _bot_account_id
+
+
+def get_latest_comment(issue_key):
+    """Returns {"year": int, "author_account_id": str or None} for the most
+    recent comment on the issue, or None if it has no comments."""
+
+    data = jira_get(
+        f"/rest/api/3/issue/{issue_key}/comment",
+        params={
+            "orderBy": "-created",
+            "maxResults": 1
+        }
+    )
+
+    comments = data.get("comments", [])
+
+    if not comments:
+        return None
+
+    latest = comments[0]
+
+    # "created" looks like "2026-07-29T00:31:00.000+0000"
+    created_str = latest["created"]
+    created_dt = datetime.strptime(created_str[:19], "%Y-%m-%dT%H:%M:%S")
+
+    return {
+        "year": created_dt.year,
+        "author_account_id": latest.get("author", {}).get("accountId")
+    }
+
+
+def get_presales_owner(issue):
+    """Returns the {accountId, displayName} of the Presales Owner field, or
+    None if it's not set.
+
+    This field is a multi-user picker in Jira, so the API returns a list
+    (even with just one person selected). We take the first person.
+    """
+
+    presales_owner_field_id = get_field_id(PRESALES_OWNER_FIELD_NAME)
+    value = issue["fields"].get(presales_owner_field_id)
+
+    if not value:
+        return None
+
+    if isinstance(value, list):
+        return value[0] if value else None
+
+    return value  # fallback, in case the field type ever changes
+
+
+def days_in_current_status(issue):
+    """Days since the issue was created -- used as the 'been in
+    Discovery/Demo Done for X days' figure in the alert comment, since the
+    JQL already restricts us to issues created before 2026 and still
+    sitting in one of those two statuses."""
+
+    created_dt = dateparser.isoparse(issue["fields"]["created"])
+    return (datetime.now(timezone.utc) - created_dt).days
+
+
+def build_adf_paragraph(text):
+    """Wraps plain text in a minimal Atlassian Document Format body, used
+    both for the Lost Reason field and for comments."""
 
     return {
         "type": "doc",
@@ -183,7 +274,7 @@ def update_fields(issue_key):
 
     payload = {
         "fields": {
-            lost_reason_field_id: build_lost_reason_adf(LOST_REASON_TEXT),
+            lost_reason_field_id: build_adf_paragraph(LOST_REASON_TEXT),
             # Lost Category is a multi-select checkbox field -- represented
             # as a list of {"value": ...} options, even for a single pick.
             lost_category_field_id: [
@@ -210,13 +301,124 @@ def transition_issue(issue_key, transition_id):
     )
 
 
+def add_alert_comment(issue_key, presales_owner, days, current_status):
+    """Posts the alert comment, tagging the Presales Owner with a real
+    clickable @mention (Jira renders a 'mention' ADF node as an actual
+    mention, not plain text) when we have their accountId."""
+
+    content = []
+
+    if presales_owner and presales_owner.get("accountId"):
+
+        content.append({
+            "type": "mention",
+            "attrs": {
+                "id": presales_owner["accountId"]
+            }
+        })
+
+        content.append({
+            "type": "text",
+            "text": " "
+        })
+
+    else:
+
+        content.append({
+            "type": "text",
+            "text": "@Presales Owner "
+        })
+
+    content.append({
+        "type": "text",
+        "text": (
+            f"please update the status of this POC, as it's been in "
+            f"\"{current_status}\" for {days} days."
+        )
+    })
+
+    jira_post(
+        f"/rest/api/3/issue/{issue_key}/comment",
+        {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": content
+                    }
+                ]
+            }
+        }
+    )
+
+
 def evaluate_issue(issue):
     """Checks one issue, prints what would happen, and returns a dict
-    describing the planned update (or None if it can't be processed, e.g.
-    no valid transition to the target status exists)."""
+    describing the planned action (or None if it can't be processed).
+
+    Two possible actions:
+      - "poc_fail": latest comment (if any) is from before CUTOFF_YEAR ->
+        set Lost Reason / Lost Category and transition to POC fail, same
+        as before.
+      - "alert": latest comment is from CUTOFF_YEAR or later -> there's
+        recent human activity, so don't touch fields/status, just post a
+        comment asking someone to confirm and update manually.
+    """
 
     key = issue["key"]
     current_status = issue["fields"]["status"]["name"]
+
+    presales_owner = get_presales_owner(issue)
+
+    if not presales_owner:
+
+        # No Presales Owner set on the ticket -- there's no one to alert
+        # and confirm with, so the comment-recency check doesn't apply.
+        # Fall straight through to POC fail based purely on how long it's
+        # been sitting in Discovery/Demo Done (same as the original logic,
+        # before the comment check existed).
+        print(
+            f"{key}: currently \"{current_status}\" -> no Presales Owner "
+            f"set, skipping comment check"
+        )
+
+    else:
+
+        latest_comment = get_latest_comment(key)
+
+        if latest_comment and latest_comment["year"] >= CUTOFF_YEAR:
+
+            if latest_comment["author_account_id"] == get_bot_account_id():
+
+                # The most recent comment is our own previous alert --
+                # nobody has responded since. Don't re-alert every batch;
+                # just leave it be until a human comments again (which will
+                # make THEIR comment the latest one on the next run).
+                print(
+                    f"{key}: currently \"{current_status}\" -> already "
+                    f"alerted and no reply since, skipping"
+                )
+
+                return None
+
+            days = days_in_current_status(issue)
+
+            print(
+                f"{key}: currently \"{current_status}\" -> latest comment is "
+                f"from {latest_comment['year']}, so will post an alert "
+                f"comment tagging {presales_owner.get('displayName', '?')} "
+                f"instead of touching fields/status"
+            )
+
+            return {
+                "key": key,
+                "action": "alert",
+                "presales_owner": presales_owner,
+                "days": days,
+                "current_status": current_status
+            }
 
     transition_id = get_transition_id(key, TARGET_STATUS_NAME)
 
@@ -234,6 +436,7 @@ def evaluate_issue(issue):
 
     return {
         "key": key,
+        "action": "poc_fail",
         "transition_id": transition_id
     }
 
@@ -320,22 +523,42 @@ def main():
             f"Set LIMIT = None to run for everyone."
         )
 
+    poc_fail_count = sum(1 for item in due if item["action"] == "poc_fail")
+    alert_count = sum(1 for item in due if item["action"] == "alert")
+
     print(
-        f"\n{len(due)} update(s) due this run."
+        f"\n{len(due)} update(s) due this run "
+        f"({poc_fail_count} POC fail, {alert_count} alert comment)."
     )
 
     for item in due:
 
         try:
 
-            print(
-                f" Updating -> {item['key']}"
-            )
+            if item["action"] == "poc_fail":
 
-            if apply:
+                print(
+                    f" Updating -> {item['key']} (POC fail)"
+                )
 
-                update_fields(item["key"])
-                transition_issue(item["key"], item["transition_id"])
+                if apply:
+                    update_fields(item["key"])
+                    transition_issue(item["key"], item["transition_id"])
+
+            elif item["action"] == "alert":
+
+                print(
+                    f" Commenting -> {item['key']} (alert only, tagging "
+                    f"{item['presales_owner'].get('displayName', '?')})"
+                )
+
+                if apply:
+                    add_alert_comment(
+                        item["key"],
+                        item["presales_owner"],
+                        item["days"],
+                        item["current_status"]
+                    )
 
         except Exception as e:
 

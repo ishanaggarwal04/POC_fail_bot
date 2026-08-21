@@ -23,6 +23,9 @@ jobs:
       - name: Set up Python
         run: uv python install
 
+      - name: Install dependencies
+        run: uv sync --frozen
+
       - name: Process POCs in batches
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
@@ -35,7 +38,7 @@ jobs:
             echo "Starting POC batch"
             echo "========================================"
 
-            OUTPUT=$(uv run --with requests python -u main.py --apply 2>&1)
+            OUTPUT=$(uv run python -u main.py --apply 2>&1)
             EXIT_CODE=$?
 
             echo "$OUTPUT"
