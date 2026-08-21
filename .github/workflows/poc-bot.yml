@@ -2,6 +2,8 @@ name: POC Bot
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "50 19 * * *"   # daily at 3:00 AM UTC (~8:30 AM IST) -- adjust as needed
 
 permissions:
   contents: read
